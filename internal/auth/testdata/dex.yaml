@@ -1,0 +1,25 @@
+issuer: http://127.0.0.1:5556/dex
+
+storage:
+  type: memory
+
+web:
+  http: 0.0.0.0:5556
+
+# Pre-registered OIDC client for bouncer-admin with PKCE support
+staticClients:
+  - id: bouncer-admin-gui
+    name: 'Bouncer Admin Console'
+    public: true
+    redirectURIs:
+      - 'http://localhost:8080/auth/callback'
+
+
+# Pre-registered test credentials
+enablePasswordDB: true
+staticPasswords:
+  - email: "admin@example.com"
+    # Plaintext "password" hashed using bcrypt
+    hash: "$2a$10$2b2cU8CPhOTaGrs1HRQuAueS7JTT5ZHsHSzYiFPm1leZck7Mc8T4W"
+    username: "admin"
+    userID: "usr-001"
