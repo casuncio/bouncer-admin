@@ -1,7 +1,6 @@
-package auth
+package authtest
 
 import (
-	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"encoding/json"
@@ -15,21 +14,21 @@ import (
 )
 
 const (
-	testClientID    = "bouncer-admin-gui"
-	testRedirectURL = "http://localhost:8080/auth/callback"
-	testKeyID       = "test-key"
-	testSubject     = "usr-001"
+	ClientID     = "bouncer-admin-gui"
+	ClientSecret = "test-secret"
+	RedirectURL  = "http://localhost:8080/auth/callback"
+	KeyID        = "test-key"
+	Subject      = "usr-001"
 )
 
-type testOIDC struct {
-	t             *testing.T
-	priv          *rsa.PrivateKey
-	server        *httptest.Server
-	authenticator *Authenticator
-	tokenHandler  http.HandlerFunc
+type Env struct {
+	T            *testing.T
+	Priv         *rsa.PrivateKey
+	Server       *httptest.Server
+	TokenHandler http.HandlerFunc
 }
 
-func setupTestOIDC(t *testing.T) *testOIDC {
+func Setup(t *testing.T) *Env {
 	t.Helper()
 
 	priv, err := rsa.GenerateKey(rand.Reader, 2048)
@@ -37,52 +36,42 @@ func setupTestOIDC(t *testing.T) *testOIDC {
 		t.Fatalf("generate RSA key: %v", err)
 	}
 
-	env := &testOIDC{t: t, priv: priv}
+	env := &Env{T: t, Priv: priv}
 
 	oidcSrv := &oidctest.Server{
 		PublicKeys: []oidctest.PublicKey{
 			{
 				PublicKey: priv.Public(),
-				KeyID:     testKeyID,
+				KeyID:     KeyID,
 				Algorithm: oidc.RS256,
 			},
 		},
 	}
 
-	env.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	env.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/token" {
-			if env.tokenHandler != nil {
-				env.tokenHandler(w, r)
+			if env.TokenHandler != nil {
+				env.TokenHandler(w, r)
 				return
 			}
-			env.defaultTokenHandler(w, r)
+			env.DefaultTokenHandler(w, r)
 			return
 		}
 		oidcSrv.ServeHTTP(w, r)
 	}))
-	t.Cleanup(env.server.Close)
-	oidcSrv.SetIssuer(env.server.URL)
+	t.Cleanup(env.Server.Close)
+	oidcSrv.SetIssuer(env.Server.URL)
 
-	authenticator, err := NewAuthenticator(context.Background(), Config{
-		IssuerURL:    env.server.URL,
-		ClientID:     testClientID,
-		ClientSecret: "test-secret",
-		RedirectURL:  testRedirectURL,
-	})
-	if err != nil {
-		t.Fatalf("NewAuthenticator: %v", err)
-	}
-	env.authenticator = authenticator
 	return env
 }
 
-func (e *testOIDC) idToken(extra map[string]any) string {
-	e.t.Helper()
+func (e *Env) IDToken(extra map[string]any) string {
+	e.T.Helper()
 
 	claims := map[string]any{
-		"iss":                e.server.URL,
-		"aud":                testClientID,
-		"sub":                testSubject,
+		"iss":                e.Server.URL,
+		"aud":                ClientID,
+		"sub":                Subject,
 		"exp":                time.Now().Add(time.Hour).Unix(),
 		"iat":                time.Now().Unix(),
 		"email":              "admin@example.com",
@@ -94,12 +83,12 @@ func (e *testOIDC) idToken(extra map[string]any) string {
 
 	raw, err := json.Marshal(claims)
 	if err != nil {
-		e.t.Fatalf("marshal ID token claims: %v", err)
+		e.T.Fatalf("marshal ID token claims: %v", err)
 	}
-	return oidctest.SignIDToken(e.priv, testKeyID, oidc.RS256, string(raw))
+	return oidctest.SignIDToken(e.Priv, KeyID, oidc.RS256, string(raw))
 }
 
-func (e *testOIDC) defaultTokenHandler(w http.ResponseWriter, r *http.Request) {
+func (e *Env) DefaultTokenHandler(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -116,7 +105,7 @@ func (e *testOIDC) defaultTokenHandler(w http.ResponseWriter, r *http.Request) {
 		"access_token":  "test-access-token",
 		"token_type":    "Bearer",
 		"expires_in":    3600,
-		"id_token":      e.idToken(nil),
+		"id_token":      e.IDToken(nil),
 		"refresh_token": "test-refresh",
 	})
 }

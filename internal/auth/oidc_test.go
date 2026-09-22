@@ -1,4 +1,4 @@
-package auth
+package auth_test
 
 import (
 	"context"
@@ -12,12 +12,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/casuncio/bouncer-admin/internal/auth"
+	"github.com/casuncio/bouncer-admin/internal/authtest"
 	"github.com/coreos/go-oidc/v3/oidc"
 	"golang.org/x/oauth2"
 )
 
 func TestGeneratePKCE(t *testing.T) {
-	verifier, challenge, err := GeneratePKCE()
+	verifier, challenge, err := auth.GeneratePKCE()
 	if err != nil {
 		t.Fatalf("GeneratePKCE() error = %v", err)
 	}
@@ -42,7 +44,7 @@ func TestGeneratePKCE(t *testing.T) {
 func TestGeneratePKCE_Unique(t *testing.T) {
 	seen := make(map[string]struct{}, 32)
 	for i := 0; i < 32; i++ {
-		verifier, _, err := GeneratePKCE()
+		verifier, _, err := auth.GeneratePKCE()
 		if err != nil {
 			t.Fatalf("GeneratePKCE() error = %v", err)
 		}
@@ -54,7 +56,7 @@ func TestGeneratePKCE_Unique(t *testing.T) {
 }
 
 func TestGenerateState(t *testing.T) {
-	state, err := GenerateState()
+	state, err := auth.GenerateState()
 	if err != nil {
 		t.Fatalf("GenerateState() error = %v", err)
 	}
@@ -69,7 +71,7 @@ func TestGenerateState(t *testing.T) {
 func TestGenerateState_Unique(t *testing.T) {
 	seen := make(map[string]struct{}, 32)
 	for i := 0; i < 32; i++ {
-		state, err := GenerateState()
+		state, err := auth.GenerateState()
 		if err != nil {
 			t.Fatalf("GenerateState() error = %v", err)
 		}
@@ -81,9 +83,9 @@ func TestGenerateState_Unique(t *testing.T) {
 }
 
 func TestAdminClaimsHasRole(t *testing.T) {
-	full := &AdminClaims{
-		RealmAccess: RealmRole{Roles: []string{"offline_access", "policy-admin"}},
-		ResourceAccess: map[string]ClientRole{
+	full := &auth.AdminClaims{
+		RealmAccess: auth.RealmRole{Roles: []string{"offline_access", "policy-admin"}},
+		ResourceAccess: map[string]auth.ClientRole{
 			"bouncer-admin-gui": {Roles: []string{"viewer", "editor"}},
 			"other-client":      {Roles: []string{"admin"}},
 		},
@@ -92,7 +94,7 @@ func TestAdminClaimsHasRole(t *testing.T) {
 
 	tests := []struct {
 		name     string
-		claims   *AdminClaims
+		claims   *auth.AdminClaims
 		clientID string
 		role     string
 		want     bool
@@ -103,17 +105,17 @@ func TestAdminClaimsHasRole(t *testing.T) {
 		{name: "role on other client", claims: full, clientID: "other-client", role: "admin", want: true},
 		{name: "other client role ignored", claims: full, clientID: "bouncer-admin-gui", role: "admin", want: false},
 		{name: "unknown role", claims: full, clientID: "bouncer-admin-gui", role: "superuser", want: false},
-		{name: "empty claims", claims: &AdminClaims{}, clientID: "bouncer-admin-gui", role: "policy-admin", want: false},
+		{name: "empty claims", claims: &auth.AdminClaims{}, clientID: "bouncer-admin-gui", role: "policy-admin", want: false},
 		{
 			name:     "realm only",
-			claims:   &AdminClaims{RealmAccess: RealmRole{Roles: []string{"policy-admin"}}},
+			claims:   &auth.AdminClaims{RealmAccess: auth.RealmRole{Roles: []string{"policy-admin"}}},
 			clientID: "bouncer-admin-gui",
 			role:     "policy-admin",
 			want:     true,
 		},
 		{
 			name: "client only",
-			claims: &AdminClaims{ResourceAccess: map[string]ClientRole{
+			claims: &auth.AdminClaims{ResourceAccess: map[string]auth.ClientRole{
 				"bouncer-admin-gui": {Roles: []string{"editor"}},
 			}},
 			clientID: "bouncer-admin-gui",
@@ -122,21 +124,21 @@ func TestAdminClaimsHasRole(t *testing.T) {
 		},
 		{
 			name:     "wrong client id",
-			claims:   &AdminClaims{ResourceAccess: map[string]ClientRole{"bouncer-admin-gui": {Roles: []string{"editor"}}}},
+			claims:   &auth.AdminClaims{ResourceAccess: map[string]auth.ClientRole{"bouncer-admin-gui": {Roles: []string{"editor"}}}},
 			clientID: "someone-else",
 			role:     "editor",
 			want:     false,
 		},
 		{
 			name:     "groups only",
-			claims:   &AdminClaims{Groups: []string{"ops"}},
+			claims:   &auth.AdminClaims{Groups: []string{"ops"}},
 			clientID: "bouncer-admin-gui",
 			role:     "ops",
 			want:     true,
 		},
 		{
 			name:     "nil resource access",
-			claims:   &AdminClaims{RealmAccess: RealmRole{Roles: []string{"r"}}},
+			claims:   &auth.AdminClaims{RealmAccess: auth.RealmRole{Roles: []string{"r"}}},
 			clientID: "c",
 			role:     "r",
 			want:     true,
@@ -153,8 +155,8 @@ func TestAdminClaimsHasRole(t *testing.T) {
 }
 
 func TestNewAuthenticator(t *testing.T) {
-	env := setupTestOIDC(t)
-	a := env.authenticator
+	env := authtest.SetupAuth(t)
+	a := env.Authenticator
 
 	if a.Provider == nil {
 		t.Fatal("Provider is nil")
@@ -162,14 +164,14 @@ func TestNewAuthenticator(t *testing.T) {
 	if a.Verifier == nil {
 		t.Fatal("Verifier is nil")
 	}
-	if a.OAuth2Config.ClientID != testClientID {
-		t.Errorf("ClientID = %q, want %q", a.OAuth2Config.ClientID, testClientID)
+	if a.OAuth2Config.ClientID != authtest.ClientID {
+		t.Errorf("ClientID = %q, want %q", a.OAuth2Config.ClientID, authtest.ClientID)
 	}
 	if a.OAuth2Config.ClientSecret != "test-secret" {
 		t.Errorf("ClientSecret = %q, want test-secret", a.OAuth2Config.ClientSecret)
 	}
-	if a.OAuth2Config.RedirectURL != testRedirectURL {
-		t.Errorf("RedirectURL = %q, want %q", a.OAuth2Config.RedirectURL, testRedirectURL)
+	if a.OAuth2Config.RedirectURL != authtest.RedirectURL {
+		t.Errorf("RedirectURL = %q, want %q", a.OAuth2Config.RedirectURL, authtest.RedirectURL)
 	}
 	if a.OAuth2Config.Endpoint.AuthStyle != oauth2.AuthStyleInParams {
 		t.Errorf("AuthStyle = %v, want AuthStyleInParams", a.OAuth2Config.Endpoint.AuthStyle)
@@ -191,9 +193,9 @@ func TestNewAuthenticator_DiscoveryFailure(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	_, err := NewAuthenticator(context.Background(), Config{
+	_, err := auth.NewAuthenticator(context.Background(), auth.Config{
 		IssuerURL: srv.URL,
-		ClientID:  testClientID,
+		ClientID:  authtest.ClientID,
 	})
 	if err == nil {
 		t.Fatal("NewAuthenticator() error = nil, want discovery failure")
@@ -204,12 +206,12 @@ func TestNewAuthenticator_DiscoveryFailure(t *testing.T) {
 }
 
 func TestAuthenticatorAuthCodeURL(t *testing.T) {
-	env := setupTestOIDC(t)
+	env := authtest.SetupAuth(t)
 
 	const state = "csrf-state"
 	const challenge = "pkce-challenge"
 
-	rawURL := env.authenticator.AuthCodeURL(state, challenge)
+	rawURL := env.Authenticator.AuthCodeURL(state, challenge)
 	parsed, err := url.Parse(rawURL)
 	if err != nil {
 		t.Fatalf("AuthCodeURL produced invalid URL %q: %v", rawURL, err)
@@ -225,11 +227,11 @@ func TestAuthenticatorAuthCodeURL(t *testing.T) {
 	if got := q.Get("code_challenge_method"); got != "S256" {
 		t.Errorf("code_challenge_method = %q, want S256", got)
 	}
-	if got := q.Get("client_id"); got != testClientID {
-		t.Errorf("client_id = %q, want %q", got, testClientID)
+	if got := q.Get("client_id"); got != authtest.ClientID {
+		t.Errorf("client_id = %q, want %q", got, authtest.ClientID)
 	}
-	if got := q.Get("redirect_uri"); got != testRedirectURL {
-		t.Errorf("redirect_uri = %q, want %q", got, testRedirectURL)
+	if got := q.Get("redirect_uri"); got != authtest.RedirectURL {
+		t.Errorf("redirect_uri = %q, want %q", got, authtest.RedirectURL)
 	}
 	if got := q.Get("response_type"); got != "code" {
 		t.Errorf("response_type = %q, want code", got)
@@ -240,10 +242,10 @@ func TestAuthenticatorAuthCodeURL(t *testing.T) {
 }
 
 func TestAuthenticatorExchange(t *testing.T) {
-	env := setupTestOIDC(t)
+	env := authtest.SetupAuth(t)
 
 	var got url.Values
-	env.tokenHandler = func(w http.ResponseWriter, r *http.Request) {
+	env.TokenHandler = func(w http.ResponseWriter, r *http.Request) {
 		if err := r.ParseForm(); err != nil {
 			t.Errorf("ParseForm: %v", err)
 		}
@@ -253,11 +255,11 @@ func TestAuthenticatorExchange(t *testing.T) {
 			"access_token": "exchanged-access",
 			"token_type":   "Bearer",
 			"expires_in":   3600,
-			"id_token":     env.idToken(nil),
+			"id_token":     env.IDToken(nil),
 		})
 	}
 
-	token, err := env.authenticator.Exchange(context.Background(), "auth-code", "pkce-verifier")
+	token, err := env.Authenticator.Exchange(context.Background(), "auth-code", "pkce-verifier")
 	if err != nil {
 		t.Fatalf("Exchange() error = %v", err)
 	}
@@ -270,20 +272,20 @@ func TestAuthenticatorExchange(t *testing.T) {
 	if got.Get("code_verifier") != "pkce-verifier" {
 		t.Errorf("token request code_verifier = %q, want pkce-verifier", got.Get("code_verifier"))
 	}
-	if got.Get("client_id") != testClientID {
-		t.Errorf("token request client_id = %q, want %q", got.Get("client_id"), testClientID)
+	if got.Get("client_id") != authtest.ClientID {
+		t.Errorf("token request client_id = %q, want %q", got.Get("client_id"), authtest.ClientID)
 	}
 }
 
 func TestAuthenticatorExchange_Error(t *testing.T) {
-	env := setupTestOIDC(t)
-	env.tokenHandler = func(w http.ResponseWriter, r *http.Request) {
+	env := authtest.SetupAuth(t)
+	env.TokenHandler = func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusUnauthorized)
 		_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid_grant"})
 	}
 
-	_, err := env.authenticator.Exchange(context.Background(), "bad-code", "verifier")
+	_, err := env.Authenticator.Exchange(context.Background(), "bad-code", "verifier")
 	if err == nil {
 		t.Fatal("Exchange() error = nil, want failure")
 	}
@@ -293,29 +295,29 @@ func TestAuthenticatorExchange_Error(t *testing.T) {
 }
 
 func TestAuthenticatorVerifyIDToken(t *testing.T) {
-	env := setupTestOIDC(t)
+	env := authtest.SetupAuth(t)
 
-	raw := env.idToken(map[string]any{
+	raw := env.IDToken(map[string]any{
 		"realm_access": map[string]any{
 			"roles": []string{"policy-admin"},
 		},
 		"resource_access": map[string]any{
-			testClientID: map[string]any{
+			authtest.ClientID: map[string]any{
 				"roles": []string{"editor"},
 			},
 		},
 		"groups": []string{"ops"},
 	})
 
-	idToken, claims, err := env.authenticator.VerifyIDToken(context.Background(), raw)
+	idToken, claims, err := env.Authenticator.VerifyIDToken(context.Background(), raw)
 	if err != nil {
 		t.Fatalf("VerifyIDToken() error = %v", err)
 	}
 	if idToken == nil {
 		t.Fatal("ID token is nil")
 	}
-	if idToken.Subject != testSubject {
-		t.Errorf("Subject = %q, want %q", idToken.Subject, testSubject)
+	if idToken.Subject != authtest.Subject {
+		t.Errorf("Subject = %q, want %q", idToken.Subject, authtest.Subject)
 	}
 	if claims.Email != "admin@example.com" {
 		t.Errorf("Email = %q, want admin@example.com", claims.Email)
@@ -323,19 +325,19 @@ func TestAuthenticatorVerifyIDToken(t *testing.T) {
 	if claims.PreferredUsername != "admin" {
 		t.Errorf("PreferredUsername = %q, want admin", claims.PreferredUsername)
 	}
-	if !claims.HasRole(testClientID, "policy-admin") {
+	if !claims.HasRole(authtest.ClientID, "policy-admin") {
 		t.Error("expected realm role policy-admin")
 	}
-	if !claims.HasRole(testClientID, "editor") {
+	if !claims.HasRole(authtest.ClientID, "editor") {
 		t.Error("expected client role editor")
 	}
-	if !claims.HasRole(testClientID, "ops") {
+	if !claims.HasRole(authtest.ClientID, "ops") {
 		t.Error("expected group ops")
 	}
 }
 
 func TestAuthenticatorVerifyIDToken_Invalid(t *testing.T) {
-	env := setupTestOIDC(t)
+	env := authtest.SetupAuth(t)
 
 	tests := []struct {
 		name  string
@@ -343,16 +345,16 @@ func TestAuthenticatorVerifyIDToken_Invalid(t *testing.T) {
 	}{
 		{name: "malformed", token: "not-a-jwt"},
 		{name: "empty", token: ""},
-		{name: "expired", token: env.idToken(map[string]any{
+		{name: "expired", token: env.IDToken(map[string]any{
 			"exp": time.Now().Add(-time.Hour).Unix(),
 			"iat": time.Now().Add(-2 * time.Hour).Unix(),
 		})},
-		{name: "wrong audience", token: env.idToken(map[string]any{"aud": "someone-else"})},
+		{name: "wrong audience", token: env.IDToken(map[string]any{"aud": "someone-else"})},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, _, err := env.authenticator.VerifyIDToken(context.Background(), tt.token)
+			_, _, err := env.Authenticator.VerifyIDToken(context.Background(), tt.token)
 			if err == nil {
 				t.Fatal("VerifyIDToken() error = nil, want failure")
 			}

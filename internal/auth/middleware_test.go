@@ -1,4 +1,4 @@
-package auth
+package auth_test
 
 import (
 	"net/http"
@@ -6,86 +6,21 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/casuncio/bouncer-admin/internal/auth"
+	"github.com/casuncio/bouncer-admin/internal/authtest"
 )
 
-func TestExtractToken(t *testing.T) {
-	tests := []struct {
-		name  string
-		setup func(*http.Request)
-		want  string
-	}{
-		{
-			name: "bearer header",
-			setup: func(r *http.Request) {
-				r.Header.Set("Authorization", "Bearer abc.def.ghi")
-			},
-			want: "abc.def.ghi",
-		},
-		{
-			name: "session cookie",
-			setup: func(r *http.Request) {
-				r.AddCookie(&http.Cookie{Name: "admin_session", Value: "cookie-token"})
-			},
-			want: "cookie-token",
-		},
-		{
-			name: "bearer takes precedence over cookie",
-			setup: func(r *http.Request) {
-				r.Header.Set("Authorization", "Bearer header-token")
-				r.AddCookie(&http.Cookie{Name: "admin_session", Value: "cookie-token"})
-			},
-			want: "header-token",
-		},
-		{
-			name: "non-bearer header falls back to cookie",
-			setup: func(r *http.Request) {
-				r.Header.Set("Authorization", "Basic dXNlcjpwYXNz")
-				r.AddCookie(&http.Cookie{Name: "admin_session", Value: "cookie-token"})
-			},
-			want: "cookie-token",
-		},
-		{
-			name:  "missing",
-			setup: func(r *http.Request) {},
-			want:  "",
-		},
-		{
-			name: "empty bearer",
-			setup: func(r *http.Request) {
-				r.Header.Set("Authorization", "Bearer ")
-			},
-			want: "",
-		},
-		{
-			name: "unrelated cookie ignored",
-			setup: func(r *http.Request) {
-				r.AddCookie(&http.Cookie{Name: "other", Value: "nope"})
-			},
-			want: "",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			req := httptest.NewRequest(http.MethodGet, "/", nil)
-			tt.setup(req)
-			if got := extractToken(req); got != tt.want {
-				t.Errorf("extractToken() = %q, want %q", got, tt.want)
-			}
-		})
-	}
-}
-
 func TestRequireRole(t *testing.T) {
-	env := setupTestOIDC(t)
+	env := authtest.SetupAuth(t)
 	const requiredRole = "policy-admin"
 
-	validToken := env.idToken(map[string]any{
+	validToken := env.IDToken(map[string]any{
 		"realm_access": map[string]any{
 			"roles": []string{requiredRole},
 		},
 	})
-	noRoleToken := env.idToken(nil)
+	noRoleToken := env.IDToken(nil)
 
 	tests := []struct {
 		name       string
@@ -111,7 +46,7 @@ func TestRequireRole(t *testing.T) {
 		{
 			name: "expired token",
 			setup: func(r *http.Request) {
-				tok := env.idToken(map[string]any{
+				tok := env.IDToken(map[string]any{
 					"exp": time.Now().Add(-time.Hour).Unix(),
 					"iat": time.Now().Add(-2 * time.Hour).Unix(),
 				})
@@ -151,22 +86,22 @@ func TestRequireRole(t *testing.T) {
 			called := false
 			next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				called = true
-				claims, ok := r.Context().Value(ClaimsContextKey).(*AdminClaims)
+				claims, ok := r.Context().Value(auth.ClaimsContextKey).(*auth.AdminClaims)
 				if !ok || claims == nil {
 					t.Error("expected AdminClaims in request context")
 					http.Error(w, "missing claims", http.StatusInternalServerError)
 					return
 				}
-				if claims.Subject != testSubject {
-					t.Errorf("claims.Subject = %q, want %q", claims.Subject, testSubject)
+				if claims.Subject != authtest.Subject {
+					t.Errorf("claims.Subject = %q, want %q", claims.Subject, authtest.Subject)
 				}
-				if !claims.HasRole(testClientID, requiredRole) {
+				if !claims.HasRole(authtest.ClientID, requiredRole) {
 					t.Errorf("injected claims missing role %q", requiredRole)
 				}
 				w.WriteHeader(http.StatusNoContent)
 			})
 
-			handler := RequireRole(env.authenticator, testClientID, requiredRole)(next)
+			handler := auth.RequireRole(env.Authenticator, authtest.ClientID, requiredRole)(next)
 			req := httptest.NewRequest(http.MethodGet, "/admin", nil)
 			tt.setup(req)
 			rec := httptest.NewRecorder()

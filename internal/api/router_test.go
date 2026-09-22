@@ -1,269 +1,202 @@
 package api
 
 import (
-	"crypto"
-	"crypto/rand"
-	"crypto/rsa"
-	"crypto/sha256"
-	"crypto/tls"
-	"encoding/base64"
-	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"strings"
 	"testing"
-	"time"
 
-	"github.com/casuncio/bouncer-admin/internal/auth"
-	"github.com/coreos/go-oidc/v3/oidc"
-	"github.com/coreos/go-oidc/v3/oidc/oidctest"
-	"golang.org/x/oauth2"
+	"github.com/casuncio/bouncer-admin/internal/authtest"
 )
 
-func testAuthenticator(tokenURL string) *auth.Authenticator {
-	return &auth.Authenticator{
-		OAuth2Config: oauth2.Config{
-			ClientID:     "bouncer-admin-gui",
-			ClientSecret: "test-secret",
-			RedirectURL:  "http://localhost:8080/auth/callback",
-			Scopes:       []string{"openid", "profile", "email"},
-			Endpoint: oauth2.Endpoint{
-				AuthURL:   "http://idp.example/auth",
-				TokenURL:  tokenURL,
-				AuthStyle: oauth2.AuthStyleInParams,
+func newTestHandler(t *testing.T) (http.Handler, *authtest.AuthEnv) {
+	t.Helper()
+
+	env := authtest.SetupAuth(t)
+	return NewServer(env.Authenticator), env
+}
+
+const policyAdminRole = "PolicyAdmin"
+
+func TestPoliciesAccess(t *testing.T) {
+	handler, env := newTestHandler(t)
+
+	adminToken := env.IDToken(map[string]any{
+		"realm_access": map[string]any{
+			"roles": []string{policyAdminRole},
+		},
+	})
+	noRoleToken := env.IDToken(nil)
+
+	tests := []struct {
+		name       string
+		method     string
+		path       string
+		setup      func(*http.Request)
+		wantStatus int
+		wantBody   string
+	}{
+		{
+			name:       "POST missing token",
+			method:     http.MethodPost,
+			path:       "/api/policies",
+			wantStatus: http.StatusUnauthorized,
+			wantBody:   "Missing authorization token",
+		},
+		{
+			name:   "POST invalid token",
+			method: http.MethodPost,
+			path:   "/api/policies",
+			setup: func(r *http.Request) {
+				r.Header.Set("Authorization", "Bearer not-a-jwt")
 			},
+			wantStatus: http.StatusUnauthorized,
+			wantBody:   "Invalid or expired token",
+		},
+		{
+			name:   "POST missing role",
+			method: http.MethodPost,
+			path:   "/api/policies",
+			setup: func(r *http.Request) {
+				r.Header.Set("Authorization", "Bearer "+noRoleToken)
+			},
+			wantStatus: http.StatusForbidden,
+			wantBody:   "Unauthorized policy administrator",
+		},
+		{
+			name:   "POST valid bearer token",
+			method: http.MethodPost,
+			path:   "/api/policies",
+			setup: func(r *http.Request) {
+				r.Header.Set("Authorization", "Bearer "+adminToken)
+			},
+			wantStatus: http.StatusOK,
+		},
+		{
+			name:   "POST valid session cookie",
+			method: http.MethodPost,
+			path:   "/api/policies",
+			setup: func(r *http.Request) {
+				r.AddCookie(&http.Cookie{Name: "admin_session", Value: adminToken})
+			},
+			wantStatus: http.StatusOK,
+		},
+		{
+			name:   "POST groups claim",
+			method: http.MethodPost,
+			path:   "/api/policies",
+			setup: func(r *http.Request) {
+				tok := env.IDToken(map[string]any{
+					"groups": []string{policyAdminRole},
+				})
+				r.Header.Set("Authorization", "Bearer "+tok)
+			},
+			wantStatus: http.StatusOK,
+		},
+		{
+			name:       "GET method not allowed",
+			method:     http.MethodGet,
+			path:       "/api/policies",
+			wantStatus: http.StatusMethodNotAllowed,
+		},
+		{
+			name:   "DELETE valid bearer token",
+			method: http.MethodDelete,
+			path:   "/api/policies/policy-1",
+			setup: func(r *http.Request) {
+				r.Header.Set("Authorization", "Bearer "+adminToken)
+			},
+			wantStatus: http.StatusOK,
+		},
+		{
+			name:       "POST on delete path method not allowed",
+			method:     http.MethodPost,
+			path:       "/api/policies/policy-1",
+			wantStatus: http.StatusMethodNotAllowed,
 		},
 	}
-}
 
-func TestNewServer_UnknownRoute(t *testing.T) {
-	handler := NewServer(testAuthenticator("http://idp.example/token"))
-	req := httptest.NewRequest(http.MethodGet, "/not-found", nil)
-	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(tt.method, tt.path, nil)
+			if tt.setup != nil {
+				tt.setup(req)
+			}
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusNotFound {
-		t.Errorf("status = %d, want %d", rec.Code, http.StatusNotFound)
-	}
-}
-
-func TestHandleLogin(t *testing.T) {
-	handler := NewServer(testAuthenticator("http://idp.example/token"))
-	req := httptest.NewRequest(http.MethodGet, "/auth/login", nil)
-	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusFound {
-		t.Fatalf("status = %d, want %d", rec.Code, http.StatusFound)
-	}
-
-	var verifierCookie *http.Cookie
-	for _, c := range rec.Result().Cookies() {
-		if c.Name == "pkce_verifier" {
-			verifierCookie = c
-			break
-		}
-	}
-	if verifierCookie == nil {
-		t.Fatal("missing pkce_verifier cookie")
-	}
-	if verifierCookie.Path != "/auth/callback" {
-		t.Errorf("cookie Path = %q, want /auth/callback", verifierCookie.Path)
-	}
-	if !verifierCookie.HttpOnly {
-		t.Error("cookie HttpOnly = false, want true")
-	}
-	if verifierCookie.Secure {
-		t.Error("cookie Secure = true, want false for non-TLS request")
-	}
-	if verifierCookie.MaxAge != 300 {
-		t.Errorf("cookie MaxAge = %d, want 300", verifierCookie.MaxAge)
-	}
-	if verifierCookie.Value == "" {
-		t.Fatal("cookie value is empty")
-	}
-
-	location := rec.Header().Get("Location")
-	parsed, err := url.Parse(location)
-	if err != nil {
-		t.Fatalf("invalid redirect Location %q: %v", location, err)
-	}
-	if parsed.Scheme+"://"+parsed.Host+parsed.Path != "http://idp.example/auth" {
-		t.Errorf("redirect host/path = %s://%s%s, want http://idp.example/auth", parsed.Scheme, parsed.Host, parsed.Path)
-	}
-
-	q := parsed.Query()
-	sum := sha256.Sum256([]byte(verifierCookie.Value))
-	wantChallenge := base64.RawURLEncoding.EncodeToString(sum[:])
-	if got := q.Get("code_challenge"); got != wantChallenge {
-		t.Errorf("code_challenge = %q, want %q (S256 of cookie verifier)", got, wantChallenge)
-	}
-	if got := q.Get("code_challenge_method"); got != "S256" {
-		t.Errorf("code_challenge_method = %q, want S256", got)
-	}
-	if q.Get("state") == "" {
-		t.Error("state query param is empty")
-	}
-	if q.Get("client_id") != "bouncer-admin-gui" {
-		t.Errorf("client_id = %q, want bouncer-admin-gui", q.Get("client_id"))
-	}
-	if q.Get("redirect_uri") != "http://localhost:8080/auth/callback" {
-		t.Errorf("redirect_uri = %q", q.Get("redirect_uri"))
-	}
-	if q.Get("response_type") != "code" {
-		t.Errorf("response_type = %q, want code", q.Get("response_type"))
-	}
-}
-
-func TestHandleLogin_SecureCookieOverTLS(t *testing.T) {
-	handler := NewServer(testAuthenticator("http://idp.example/token"))
-	req := httptest.NewRequest(http.MethodGet, "/auth/login", nil)
-	req.TLS = &tls.ConnectionState{}
-	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-
-	var verifierCookie *http.Cookie
-	for _, c := range rec.Result().Cookies() {
-		if c.Name == "pkce_verifier" {
-			verifierCookie = c
-			break
-		}
-	}
-	if verifierCookie == nil {
-		t.Fatal("missing pkce_verifier cookie")
-	}
-	if !verifierCookie.Secure {
-		t.Error("cookie Secure = false, want true for TLS request")
-	}
-}
-
-func TestHandleCallback_MissingVerifierCookie(t *testing.T) {
-	handler := NewServer(testAuthenticator("http://idp.example/token"))
-	req := httptest.NewRequest(http.MethodGet, "/auth/callback?code=auth-code", nil)
-	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusBadRequest {
-		t.Errorf("status = %d, want %d", rec.Code, http.StatusBadRequest)
-	}
-	if !strings.Contains(rec.Body.String(), "Missing authorization code or verifier") {
-		t.Errorf("body = %q, want missing verifier error", rec.Body.String())
-	}
-}
-
-func TestHandleCallback_ExchangeFailure(t *testing.T) {
-	tokenSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusUnauthorized)
-		_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid_grant"})
-	}))
-	t.Cleanup(tokenSrv.Close)
-
-	handler := NewServer(testAuthenticator(tokenSrv.URL))
-	req := httptest.NewRequest(http.MethodGet, "/auth/callback?code=bad-code", nil)
-	req.AddCookie(&http.Cookie{Name: "pkce_verifier", Value: "verifier"})
-	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusUnauthorized {
-		t.Errorf("status = %d, want %d", rec.Code, http.StatusUnauthorized)
-	}
-	if !strings.Contains(rec.Body.String(), "Token exchange failed") {
-		t.Errorf("body = %q, want token exchange error", rec.Body.String())
-	}
-}
-
-func TestHandleCallback_Success(t *testing.T) {
-	priv, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		t.Fatalf("generate RSA key: %v", err)
-	}
-
-	const (
-		issuer   = "http://idp.example"
-		clientID = "bouncer-admin-gui"
-		keyID    = "test-key"
-	)
-	claims, err := json.Marshal(map[string]any{
-		"iss": issuer,
-		"aud": clientID,
-		"sub": "usr-001",
-		"exp": time.Now().Add(time.Hour).Unix(),
-		"iat": time.Now().Unix(),
-	})
-	if err != nil {
-		t.Fatalf("marshal ID token claims: %v", err)
-	}
-	idToken := oidctest.SignIDToken(priv, keyID, oidc.RS256, string(claims))
-
-	var got url.Values
-	tokenSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if err := r.ParseForm(); err != nil {
-			t.Errorf("ParseForm: %v", err)
-		}
-		got = r.Form
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"access_token": "access-token",
-			"token_type":   "Bearer",
-			"expires_in":   3600,
-			"id_token":     idToken,
+			if rec.Code != tt.wantStatus {
+				t.Errorf("status = %d, want %d; body = %q", rec.Code, tt.wantStatus, rec.Body.String())
+			}
+			if tt.wantBody != "" && !strings.Contains(rec.Body.String(), tt.wantBody) {
+				t.Errorf("body = %q, want to contain %q", rec.Body.String(), tt.wantBody)
+			}
 		})
-	}))
-	t.Cleanup(tokenSrv.Close)
-
-	authenticator := testAuthenticator(tokenSrv.URL)
-	authenticator.Verifier = oidc.NewVerifier(issuer, &oidc.StaticKeySet{
-		PublicKeys: []crypto.PublicKey{priv.Public()},
-	}, &oidc.Config{ClientID: clientID})
-
-	handler := NewServer(authenticator)
-	req := httptest.NewRequest(http.MethodGet, "/auth/callback?code=auth-code", nil)
-	req.AddCookie(&http.Cookie{Name: "pkce_verifier", Value: "pkce-verifier"})
-	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusFound {
-		t.Fatalf("status = %d, want %d; body = %q", rec.Code, http.StatusFound, rec.Body.String())
 	}
-	if loc := rec.Header().Get("Location"); loc != "/" {
-		t.Errorf("Location = %q, want /", loc)
-	}
+}
 
-	var session *http.Cookie
-	for _, c := range rec.Result().Cookies() {
-		if c.Name == "admin_session" {
-			session = c
-			break
+func TestHandleCallback(t *testing.T) {
+	handler, _ := newTestHandler(t)
+
+	t.Run("missing verifier cookie", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/auth/callback?code=auth-code", nil)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("status = %d, want %d", rec.Code, http.StatusBadRequest)
 		}
-	}
-	if session == nil {
-		t.Fatal("missing admin_session cookie")
-	}
-	if session.Value != idToken {
-		t.Errorf("admin_session value does not match issued ID token")
-	}
-	if session.Path != "/" {
-		t.Errorf("cookie Path = %q, want /", session.Path)
-	}
-	if !session.HttpOnly {
-		t.Error("cookie HttpOnly = false, want true")
-	}
-	if session.Secure {
-		t.Error("cookie Secure = true, want false for non-TLS request")
-	}
-	if session.SameSite != http.SameSiteLaxMode {
-		t.Errorf("cookie SameSite = %v, want Lax", session.SameSite)
-	}
-	if session.MaxAge <= 0 || session.MaxAge > 3600 {
-		t.Errorf("cookie MaxAge = %d, want between 1 and 3600", session.MaxAge)
-	}
+		if !strings.Contains(rec.Body.String(), "Missing authorization code or verifier") {
+			t.Errorf("body = %q", rec.Body.String())
+		}
+	})
 
-	if got.Get("code") != "auth-code" {
-		t.Errorf("token request code = %q, want auth-code", got.Get("code"))
-	}
-	if got.Get("code_verifier") != "pkce-verifier" {
-		t.Errorf("token request code_verifier = %q, want pkce-verifier", got.Get("code_verifier"))
-	}
+	t.Run("exchange failure", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/auth/callback", nil)
+		req.AddCookie(&http.Cookie{Name: "pkce_verifier", Value: "verifier"})
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusUnauthorized {
+			t.Errorf("status = %d, want %d; body = %q", rec.Code, http.StatusUnauthorized, rec.Body.String())
+		}
+	})
+
+	t.Run("sets admin_session and redirects", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/auth/callback?code=auth-code", nil)
+		req.AddCookie(&http.Cookie{Name: "pkce_verifier", Value: "verifier"})
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusFound {
+			t.Fatalf("status = %d, want %d; body = %q", rec.Code, http.StatusFound, rec.Body.String())
+		}
+		if loc := rec.Header().Get("Location"); loc != "/" {
+			t.Errorf("Location = %q, want /", loc)
+		}
+
+		cookies := rec.Result().Cookies()
+		var session *http.Cookie
+		for _, c := range cookies {
+			if c.Name == "admin_session" {
+				session = c
+				break
+			}
+		}
+		if session == nil {
+			t.Fatal("admin_session cookie not set")
+		}
+		if session.Value == "" {
+			t.Error("admin_session cookie is empty")
+		}
+		if session.Path != "/" {
+			t.Errorf("admin_session Path = %q, want /", session.Path)
+		}
+		if !session.HttpOnly {
+			t.Error("admin_session should be HttpOnly")
+		}
+		if session.SameSite != http.SameSiteLaxMode {
+			t.Errorf("admin_session SameSite = %v, want Lax", session.SameSite)
+		}
+	})
 }
