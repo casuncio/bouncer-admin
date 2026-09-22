@@ -3,6 +3,7 @@ package api
 import (
 	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/casuncio/bouncer-admin/internal/auth"
 )
@@ -18,9 +19,15 @@ func NewServer(authenticator *auth.Authenticator) http.Handler {
 
 	mux := http.NewServeMux()
 
-	// Register Handlers
+	// Public Auth Endpoints
 	mux.HandleFunc("/auth/login", s.handleLogin)
 	mux.HandleFunc("/auth/callback", s.handleCallback)
+
+	// Protected Policy Admin Endpoints
+	adminMiddleware := auth.RequireRole(authenticator, "bouncer-admin-gui", "PolicyAdmin")
+
+	mux.Handle("POST /api/policies", adminMiddleware(http.HandlerFunc(s.handleUpsertPolicy)))
+	mux.Handle("DELETE /api/policies/{id}", adminMiddleware(http.HandlerFunc(s.handleDeletePolicy)))
 
 	return mux
 }
@@ -68,6 +75,42 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Process token
-	_ = token
+	rawIDToken, ok := token.Extra("id_token").(string)
+	if !ok || rawIDToken == "" {
+		http.Error(w, "Missing ID token", http.StatusUnauthorized)
+		return
+	}
+
+	idToken, _, err := s.auth.VerifyIDToken(r.Context(), rawIDToken)
+	if err != nil {
+		http.Error(w, "Invalid or expired token", http.StatusUnauthorized)
+		return
+	}
+
+	maxAge := int(time.Until(idToken.Expiry).Seconds())
+	if maxAge < 0 {
+		maxAge = 0
+	}
+
+	http.SetCookie(w, &http.Cookie{
+		Name:     "admin_session",
+		Value:    rawIDToken,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   r.TLS != nil,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   maxAge,
+	})
+
+	http.Redirect(w, r, "/", http.StatusFound)
+}
+
+func (s *Server) handleUpsertPolicy(w http.ResponseWriter, r *http.Request) {
+	// Stub
+	slog.Info("UpsertPolicy request Received")
+}
+
+func (s *Server) handleDeletePolicy(w http.ResponseWriter, r *http.Request) {
+	// Stub
+	slog.Info("DeletePolicy request Received")
 }

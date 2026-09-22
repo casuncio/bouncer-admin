@@ -1,6 +1,9 @@
 package api
 
 import (
+	"crypto"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
@@ -10,8 +13,11 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/casuncio/bouncer-admin/internal/auth"
+	"github.com/coreos/go-oidc/v3/oidc"
+	"github.com/coreos/go-oidc/v3/oidc/oidctest"
 	"golang.org/x/oauth2"
 )
 
@@ -169,6 +175,28 @@ func TestHandleCallback_ExchangeFailure(t *testing.T) {
 }
 
 func TestHandleCallback_Success(t *testing.T) {
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("generate RSA key: %v", err)
+	}
+
+	const (
+		issuer   = "http://idp.example"
+		clientID = "bouncer-admin-gui"
+		keyID    = "test-key"
+	)
+	claims, err := json.Marshal(map[string]any{
+		"iss": issuer,
+		"aud": clientID,
+		"sub": "usr-001",
+		"exp": time.Now().Add(time.Hour).Unix(),
+		"iat": time.Now().Unix(),
+	})
+	if err != nil {
+		t.Fatalf("marshal ID token claims: %v", err)
+	}
+	idToken := oidctest.SignIDToken(priv, keyID, oidc.RS256, string(claims))
+
 	var got url.Values
 	tokenSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if err := r.ParseForm(); err != nil {
@@ -180,19 +208,58 @@ func TestHandleCallback_Success(t *testing.T) {
 			"access_token": "access-token",
 			"token_type":   "Bearer",
 			"expires_in":   3600,
+			"id_token":     idToken,
 		})
 	}))
 	t.Cleanup(tokenSrv.Close)
 
-	handler := NewServer(testAuthenticator(tokenSrv.URL))
+	authenticator := testAuthenticator(tokenSrv.URL)
+	authenticator.Verifier = oidc.NewVerifier(issuer, &oidc.StaticKeySet{
+		PublicKeys: []crypto.PublicKey{priv.Public()},
+	}, &oidc.Config{ClientID: clientID})
+
+	handler := NewServer(authenticator)
 	req := httptest.NewRequest(http.MethodGet, "/auth/callback?code=auth-code", nil)
 	req.AddCookie(&http.Cookie{Name: "pkce_verifier", Value: "pkce-verifier"})
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want %d; body = %q", rec.Code, http.StatusOK, rec.Body.String())
+	if rec.Code != http.StatusFound {
+		t.Fatalf("status = %d, want %d; body = %q", rec.Code, http.StatusFound, rec.Body.String())
 	}
+	if loc := rec.Header().Get("Location"); loc != "/" {
+		t.Errorf("Location = %q, want /", loc)
+	}
+
+	var session *http.Cookie
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == "admin_session" {
+			session = c
+			break
+		}
+	}
+	if session == nil {
+		t.Fatal("missing admin_session cookie")
+	}
+	if session.Value != idToken {
+		t.Errorf("admin_session value does not match issued ID token")
+	}
+	if session.Path != "/" {
+		t.Errorf("cookie Path = %q, want /", session.Path)
+	}
+	if !session.HttpOnly {
+		t.Error("cookie HttpOnly = false, want true")
+	}
+	if session.Secure {
+		t.Error("cookie Secure = true, want false for non-TLS request")
+	}
+	if session.SameSite != http.SameSiteLaxMode {
+		t.Errorf("cookie SameSite = %v, want Lax", session.SameSite)
+	}
+	if session.MaxAge <= 0 || session.MaxAge > 3600 {
+		t.Errorf("cookie MaxAge = %d, want between 1 and 3600", session.MaxAge)
+	}
+
 	if got.Get("code") != "auth-code" {
 		t.Errorf("token request code = %q, want auth-code", got.Get("code"))
 	}

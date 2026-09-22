@@ -20,6 +20,28 @@ This repository serves as the management control plane for the **Dynamic ABAC En
 * **Frontend:** Embedded SPA served via Go `embed.FS`
 * **State Management:** Git (Persistence) & Redis Streams (Distribution)
 
+## Local Testing with Dex
+
+For local OIDC testing, run [Dex](https://github.com/dexidp/dex) with the pre-configured test IdP from `internal/auth/testdata/dex.yaml`.
+
+Start the container from the root of the repo:
+
+```bash
+docker run --rm -d \
+  --name dex-oidc-test \
+  -p 5556:5556 \
+  -v "$(pwd)/internal/auth/testdata/dex.yaml":/etc/dex/config.docker.yaml \
+  ghcr.io/dexidp/dex:v2.41.0
+```
+
+Stop the container:
+
+```bash
+docker stop dex-oidc-test
+```
+
+The config registers the `bouncer-admin-gui` client (redirect URI `http://localhost:8080/auth/callback`) and a test user: `admin@example.com` / `password`. See `internal/auth/testdata/README.md` for details.
+
 ## License
 
 This project is licensed under the Apache 2.0 License - see the `LICENSE` file for details.
