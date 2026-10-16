@@ -92,9 +92,21 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 		maxAge = 0
 	}
 
+	// Seal the full token set into the session cookie: the raw ID token must
+	// never leave the server in plaintext.
+	sealed, err := s.auth.Sessions.Seal(auth.TokenSet{
+		IDToken:      rawIDToken,
+		AccessToken:  token.AccessToken,
+		RefreshToken: token.RefreshToken,
+	})
+	if err != nil {
+		http.Error(w, "Failed to establish session", http.StatusInternalServerError)
+		return
+	}
+
 	http.SetCookie(w, &http.Cookie{
-		Name:     "admin_session",
-		Value:    rawIDToken,
+		Name:     auth.SessionCookieName,
+		Value:    sealed,
 		Path:     "/",
 		HttpOnly: true,
 		Secure:   r.TLS != nil,

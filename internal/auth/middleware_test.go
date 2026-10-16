@@ -74,10 +74,21 @@ func TestRequireRole(t *testing.T) {
 		{
 			name: "valid session cookie",
 			setup: func(r *http.Request) {
-				r.AddCookie(&http.Cookie{Name: "admin_session", Value: validToken})
+				r.AddCookie(&http.Cookie{
+					Name:  auth.SessionCookieName,
+					Value: env.SealSession(t, auth.TokenSet{IDToken: validToken}),
+				})
 			},
 			wantStatus: http.StatusNoContent,
 			wantNext:   true,
+		},
+		{
+			name: "raw token in session cookie rejected",
+			setup: func(r *http.Request) {
+				r.AddCookie(&http.Cookie{Name: auth.SessionCookieName, Value: validToken})
+			},
+			wantStatus: http.StatusUnauthorized,
+			wantBody:   "Invalid or expired token",
 		},
 	}
 

@@ -164,6 +164,9 @@ func TestNewAuthenticator(t *testing.T) {
 	if a.Verifier == nil {
 		t.Fatal("Verifier is nil")
 	}
+	if a.Sessions == nil {
+		t.Fatal("Sessions is nil")
+	}
 	if a.OAuth2Config.ClientID != authtest.ClientID {
 		t.Errorf("ClientID = %q, want %q", a.OAuth2Config.ClientID, authtest.ClientID)
 	}
@@ -202,6 +205,21 @@ func TestNewAuthenticator_DiscoveryFailure(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "failed to discover oidc provider") {
 		t.Errorf("error = %v, want wrapped discovery error", err)
+	}
+}
+
+func TestNewAuthenticator_MissingSessionSecret(t *testing.T) {
+	env := authtest.SetupAuth(t)
+
+	_, err := auth.NewAuthenticator(context.Background(), auth.Config{
+		IssuerURL: env.Server.URL,
+		ClientID:  authtest.ClientID,
+	})
+	if err == nil {
+		t.Fatal("NewAuthenticator() error = nil, want missing session secret failure")
+	}
+	if !strings.Contains(err.Error(), "session secret must not be empty") {
+		t.Errorf("error = %v, want missing session secret error", err)
 	}
 }
 

@@ -7,9 +7,9 @@ All testing documentation lives here: the unit test harness, the local Dex IdP, 
 Unit tests need no external services. The shared harness in `internal/authtest` starts an in-process OIDC issuer (built on `go-oidc/v3/oidc/oidctest`) that signs real ID tokens:
 
 * `authtest.Setup(t)` — mock issuer plus an `Env` for minting ID tokens and intercepting token requests
-* `authtest.SetupAuth(t)` — the same issuer paired with a fully discovered `auth.Authenticator`
+* `authtest.SetupAuth(t)` — the same issuer paired with a fully discovered `auth.Authenticator` (and the `SessionCodec` used to seal `admin_session` cookies)
 
-The `internal/auth` and `internal/api` suites both build on it.
+The `internal/auth` and `internal/api` suites both build on it, and `internal/auth/session_test.go` covers the AES-256-GCM codec that seals the session cookie (round trips, nonce uniqueness, tamper and wrong-key rejection).
 
 ```bash
 go test ./...
@@ -39,6 +39,17 @@ docker stop dex-oidc-test
 
 The config registers the `bouncer-admin-gui` client (redirect URI `http://localhost:8080/auth/callback`) and a test user: `admin@example.com` / `password`.
 
+## Session secret
+
+The `admin_session` cookie is sealed with an AES-256-GCM key derived from `SESSION_SECRET`:
+
+* **Unset (local dev):** the server generates an ephemeral key at startup and logs a warning — `go run ./cmd/bouncer-admin` stays zero-config, but every restart invalidates sessions.
+* **Real deployments:** set a stable, high-entropy secret:
+
+```bash
+export SESSION_SECRET="$(openssl rand -base64 32)"
+```
+
 ## Testing `/api/policies`
 
 Policy admin routes require a verified ID token and the `PolicyAdmin` role on client `bouncer-admin-gui` (realm role, client role, or `groups` claim). Allowed methods are `POST /api/policies` and `DELETE /api/policies/{id}`.
@@ -58,14 +69,15 @@ curl -i -X POST http://127.0.0.1:8080/api/policies
 curl -i -X POST -H 'Authorization: Bearer not-a-jwt' http://127.0.0.1:8080/api/policies
 ```
 
-Browser login sets an `admin_session` cookie on `/auth/callback`. Dex tokens still lack `PolicyAdmin`, so the API returns **403**:
+Browser login sets an `admin_session` cookie on `/auth/callback`. The cookie does **not** hold the raw ID token — it holds an AES-256-GCM-sealed token set (ID + access + refresh tokens), so its value is opaque. Dex tokens still lack `PolicyAdmin`, so the API returns **403**:
 
 1. Open `http://localhost:8080/auth/login`
 2. Sign in as `admin@example.com` / `password`
-3. Copy the `admin_session` cookie from the callback response (or browser storage) and replay it:
+3. Copy the full `admin_session` cookie value from the callback response (or browser storage) and replay it:
 
 ```bash
-curl -i -X POST --cookie 'admin_session=<id_token>' http://127.0.0.1:8080/api/policies
+curl -i -X POST --cookie 'admin_session=<cookie value>' http://127.0.0.1:8080/api/policies
+# → 403 Unauthorized policy administrator
 ```
 
 Password grant (no browser) for a **403** Bearer token:
@@ -83,4 +95,11 @@ TOKEN=$(curl -sS -X POST 'http://127.0.0.1:5556/dex/token' \
 
 curl -i -X POST -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/api/policies
 # → 403 Unauthorized policy administrator
+```
+
+The session cookie must be encrypted: a raw ID token replayed as `admin_session` cannot be decrypted and is rejected like any invalid token (a sealed cookie from step 3 above still works):
+
+```bash
+curl -i -X POST --cookie "admin_session=$TOKEN" http://127.0.0.1:8080/api/policies
+# → 401 Invalid or expired token
 ```

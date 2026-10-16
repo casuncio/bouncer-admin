@@ -19,6 +19,9 @@ const (
 	RedirectURL  = "http://localhost:8080/auth/callback"
 	KeyID        = "test-key"
 	Subject      = "usr-001"
+
+	// SessionSecret seals admin_session cookies minted by the test harness.
+	SessionSecret = "test-session-secret"
 )
 
 type Env struct {

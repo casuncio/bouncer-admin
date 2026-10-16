@@ -13,16 +13,18 @@ import (
 )
 
 type Config struct {
-	IssuerURL    string // e.g., "http://localhost:8080/realms/bouncer"
-	ClientID     string // Client ID configured in IdP (Keycloak)
-	ClientSecret string // Optional if using public client with PKCE
-	RedirectURL  string // e.g., "http://localhost:8081/auth/callback"
+	IssuerURL     string // e.g., "http://localhost:8080/realms/bouncer"
+	ClientID      string // Client ID configured in IdP (Keycloak)
+	ClientSecret  string // Optional if using public client with PKCE
+	RedirectURL   string // e.g., "http://localhost:8081/auth/callback"
+	SessionSecret string // Secret used to seal the admin session cookie (AES-256-GCM)
 }
 
 type Authenticator struct {
 	Provider     *oidc.Provider
 	OAuth2Config oauth2.Config
 	Verifier     *oidc.IDTokenVerifier
+	Sessions     *SessionCodec
 }
 
 // AdminClaims holds extracted Identity and Access claims from the ID/Access token.
@@ -65,10 +67,16 @@ func NewAuthenticator(ctx context.Context, cfg Config) (*Authenticator, error) {
 		ClientID: cfg.ClientID,
 	})
 
+	sessions, err := NewSessionCodec(cfg.SessionSecret)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create session codec: %w", err)
+	}
+
 	return &Authenticator{
 		Provider:     provider,
 		OAuth2Config: oauthConfig,
 		Verifier:     verifier,
+		Sessions:     sessions,
 	}, nil
 }
 

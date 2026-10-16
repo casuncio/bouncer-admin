@@ -1,11 +1,13 @@
 package api
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
+	"github.com/casuncio/bouncer-admin/internal/auth"
 	"github.com/casuncio/bouncer-admin/internal/authtest"
 )
 
@@ -77,9 +79,22 @@ func TestPoliciesAccess(t *testing.T) {
 			method: http.MethodPost,
 			path:   "/api/policies",
 			setup: func(r *http.Request) {
-				r.AddCookie(&http.Cookie{Name: "admin_session", Value: adminToken})
+				r.AddCookie(&http.Cookie{
+					Name:  auth.SessionCookieName,
+					Value: env.SealSession(t, auth.TokenSet{IDToken: adminToken}),
+				})
 			},
 			wantStatus: http.StatusOK,
+		},
+		{
+			name:   "POST raw token in session cookie",
+			method: http.MethodPost,
+			path:   "/api/policies",
+			setup: func(r *http.Request) {
+				r.AddCookie(&http.Cookie{Name: auth.SessionCookieName, Value: adminToken})
+			},
+			wantStatus: http.StatusUnauthorized,
+			wantBody:   "Invalid or expired token",
 		},
 		{
 			name:   "POST groups claim",
@@ -136,7 +151,7 @@ func TestPoliciesAccess(t *testing.T) {
 }
 
 func TestHandleCallback(t *testing.T) {
-	handler, _ := newTestHandler(t)
+	handler, env := newTestHandler(t)
 
 	t.Run("missing verifier cookie", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "/auth/callback?code=auth-code", nil)
@@ -197,6 +212,25 @@ func TestHandleCallback(t *testing.T) {
 		}
 		if session.SameSite != http.SameSiteLaxMode {
 			t.Errorf("admin_session SameSite = %v, want Lax", session.SameSite)
+		}
+
+		// The cookie must hold a sealed token set, not the raw ID token.
+		set, err := env.SessionCodec.Open(session.Value)
+		if err != nil {
+			t.Fatalf("open admin_session cookie: %v", err)
+		}
+		if set.AccessToken != "test-access-token" {
+			t.Errorf("sealed AccessToken = %q, want test-access-token", set.AccessToken)
+		}
+		if set.RefreshToken != "test-refresh" {
+			t.Errorf("sealed RefreshToken = %q, want test-refresh", set.RefreshToken)
+		}
+		idToken, _, err := env.Authenticator.VerifyIDToken(context.Background(), set.IDToken)
+		if err != nil {
+			t.Fatalf("verify sealed ID token: %v", err)
+		}
+		if idToken.Subject != authtest.Subject {
+			t.Errorf("sealed ID token subject = %q, want %q", idToken.Subject, authtest.Subject)
 		}
 	})
 }

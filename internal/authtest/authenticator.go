@@ -12,23 +12,42 @@ import (
 type AuthEnv struct {
 	*Env
 	Authenticator *auth.Authenticator
+	SessionCodec  *auth.SessionCodec
 }
 
 // SetupAuth starts a mock OIDC issuer and returns it paired with an
-// Authenticator discovered from that issuer via OIDC discovery.
+// Authenticator discovered from that issuer via OIDC discovery. The
+// Authenticator seals session cookies with SessionSecret.
 func SetupAuth(t *testing.T) *AuthEnv {
 	t.Helper()
 
 	env := Setup(t)
 	authenticator, err := auth.NewAuthenticator(context.Background(), auth.Config{
-		IssuerURL:    env.Server.URL,
-		ClientID:     ClientID,
-		ClientSecret: ClientSecret,
-		RedirectURL:  RedirectURL,
+		IssuerURL:     env.Server.URL,
+		ClientID:      ClientID,
+		ClientSecret:  ClientSecret,
+		RedirectURL:   RedirectURL,
+		SessionSecret: SessionSecret,
 	})
 	if err != nil {
 		t.Fatalf("NewAuthenticator: %v", err)
 	}
 
-	return &AuthEnv{Env: env, Authenticator: authenticator}
+	return &AuthEnv{
+		Env:           env,
+		Authenticator: authenticator,
+		SessionCodec:  authenticator.Sessions,
+	}
+}
+
+// SealSession seals a token set exactly the way the /auth/callback handler
+// seals the admin_session cookie. Use it to mint session cookies in tests.
+func (e *AuthEnv) SealSession(t *testing.T, set auth.TokenSet) string {
+	t.Helper()
+
+	sealed, err := e.SessionCodec.Seal(set)
+	if err != nil {
+		t.Fatalf("seal session: %v", err)
+	}
+	return sealed
 }

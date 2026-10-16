@@ -16,8 +16,12 @@ func RequireRole(authenticator *Authenticator, clientID, requiredRole string) fu
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 
-			// 1. Extract the JWT from the Authorization header or session cookie
-			rawToken := extractToken(r)
+			// 1. Extract the JWT from the Authorization header or the sealed session cookie
+			rawToken, err := extractToken(r, authenticator.Sessions)
+			if err != nil {
+				http.Error(w, "Invalid or expired token", http.StatusUnauthorized)
+				return
+			}
 			if rawToken == "" {
 				http.Error(w, "Missing authorization token", http.StatusUnauthorized)
 				return
@@ -43,17 +47,31 @@ func RequireRole(authenticator *Authenticator, clientID, requiredRole string) fu
 	}
 }
 
-// extractToken attempts to pull the Bearer token from the header, falling back to a session cookie.
-func extractToken(r *http.Request) string {
+// extractToken attempts to pull the Bearer token from the header, falling back
+// to the ID token sealed inside the session cookie.
+//
+// A session cookie that cannot be decrypted yields an error so the middleware
+// answers with "Invalid or expired token" instead of "Missing authorization
+// token": callers must not be able to distinguish a tampered cookie from a bad
+// JWT.
+func extractToken(r *http.Request, sessions *SessionCodec) (string, error) {
 	authHeader := r.Header.Get("Authorization")
 	if strings.HasPrefix(authHeader, "Bearer ") {
-		return strings.TrimPrefix(authHeader, "Bearer ")
+		return strings.TrimPrefix(authHeader, "Bearer "), nil
 	}
 
-	// Fallback for browser-based UI administration
-	if cookie, err := r.Cookie("admin_session"); err == nil {
-		return cookie.Value
+	// Fallback for browser-based UI administration: the cookie carries an
+	// AES-256-GCM-sealed TokenSet; verification uses its ID token.
+	if cookie, err := r.Cookie(SessionCookieName); err == nil {
+		if sessions == nil {
+			return "", errInvalidSession
+		}
+		set, err := sessions.Open(cookie.Value)
+		if err != nil {
+			return "", err
+		}
+		return set.IDToken, nil
 	}
 
-	return ""
+	return "", nil
 }
