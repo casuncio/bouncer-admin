@@ -80,6 +80,19 @@ func NewAuthenticator(ctx context.Context, cfg Config) (*Authenticator, error) {
 	}, nil
 }
 
+// Browser cookies carrying the login flow between /auth/login and
+// /auth/callback. Both are scoped to Path=/auth/callback, expire after 300s,
+// and are cleared once the callback completes a login.
+const (
+	// StateCookieName carries the CSRF state value sent to the IdP; the
+	// callback compares it against the state query parameter.
+	StateCookieName = "auth_state"
+
+	// PKCEVerifierCookieName carries the PKCE verifier, sealed with the
+	// session codec so the plaintext verifier never reaches the browser.
+	PKCEVerifierCookieName = "pkce_verifier"
+)
+
 // GeneratePKCE creates a high-entropy verifier and its corresponding SHA-256 challenge.
 func GeneratePKCE() (verifier, challenge string, err error) {
 	raw := make([]byte, 32)

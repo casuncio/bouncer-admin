@@ -164,3 +164,115 @@ func TestSessionCodec_OpenInvalidValues(t *testing.T) {
 		})
 	}
 }
+
+func TestSessionCodec_ValueRoundTrip(t *testing.T) {
+	codec := mustSessionCodec(t, "test-secret")
+
+	const verifier = "dBjftJeZ4lVP-gzGK5T-7YiZ0ZWf4aOEbYfjRwLsc0Q"
+
+	sealed, err := codec.SealValue(verifier)
+	if err != nil {
+		t.Fatalf("SealValue() error = %v", err)
+	}
+	if sealed == "" {
+		t.Fatal("SealValue() returned an empty value")
+	}
+	if strings.ContainsAny(sealed, "+/=") {
+		t.Errorf("SealValue() = %q, want cookie-safe raw base64url", sealed)
+	}
+	if sealed == verifier {
+		t.Error("SealValue() returned the plaintext verifier")
+	}
+
+	got, err := codec.OpenValue(sealed)
+	if err != nil {
+		t.Fatalf("OpenValue() error = %v", err)
+	}
+	if got != verifier {
+		t.Errorf("round trip = %q, want %q", got, verifier)
+	}
+}
+
+func TestSessionCodec_ValueSealUniquePerCall(t *testing.T) {
+	codec := mustSessionCodec(t, "test-secret")
+
+	first, err := codec.SealValue("verifier")
+	if err != nil {
+		t.Fatalf("first SealValue() error = %v", err)
+	}
+	second, err := codec.SealValue("verifier")
+	if err != nil {
+		t.Fatalf("second SealValue() error = %v", err)
+	}
+
+	if first == second {
+		t.Fatal("sealing the same value twice produced identical values; nonce reuse")
+	}
+}
+
+func TestSessionCodec_OpenValueInvalid(t *testing.T) {
+	codec := mustSessionCodec(t, "test-secret")
+
+	sealed, err := codec.SealValue("verifier")
+	if err != nil {
+		t.Fatalf("SealValue() error = %v", err)
+	}
+
+	// Replace the first base64 character with a different valid one so the
+	// value still decodes and the GCM authentication is what fails.
+	mutated := []byte(sealed)
+	if mutated[0] == 'A' {
+		mutated[0] = 'B'
+	} else {
+		mutated[0] = 'A'
+	}
+
+	tests := []struct {
+		name  string
+		value string
+	}{
+		{name: "empty", value: ""},
+		{name: "invalid base64", value: "not!base64"},
+		{name: "too short", value: "AAAA"},
+		{name: "raw verifier", value: "raw-verifier"},
+		{name: "tampered", value: string(mutated)},
+		{name: "truncated", value: sealed[:len(sealed)-4]},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := codec.OpenValue(tt.value); err == nil {
+				t.Errorf("OpenValue(%q) error = nil, want failure", tt.value)
+			}
+		})
+	}
+}
+
+func TestSessionCodec_OpenValueWrongKey(t *testing.T) {
+	sealer := mustSessionCodec(t, "correct-secret")
+	opener := mustSessionCodec(t, "different-secret")
+
+	sealed, err := sealer.SealValue("verifier")
+	if err != nil {
+		t.Fatalf("SealValue() error = %v", err)
+	}
+
+	if _, err := opener.OpenValue(sealed); err == nil {
+		t.Error("OpenValue() error = nil, want wrong-key failure")
+	}
+}
+
+// A verifier sealed by SealValue is not a JSON token set, so it cannot be
+// replayed as a session cookie.
+func TestSessionCodec_OpenRejectsSealedValues(t *testing.T) {
+	codec := mustSessionCodec(t, "test-secret")
+
+	sealed, err := codec.SealValue("pkce-verifier")
+	if err != nil {
+		t.Fatalf("SealValue() error = %v", err)
+	}
+
+	if _, err := codec.Open(sealed); err == nil {
+		t.Error("Open(SealValue(...)) error = nil, want failure")
+	}
+}

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"crypto/subtle"
 	"log/slog"
 	"net/http"
 	"time"
@@ -38,16 +39,44 @@ func NewServer(authenticator *auth.Authenticator) http.Handler {
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	slog.Info("Login request recieved")
 
-	verifier, challenge, _ := auth.GeneratePKCE()
+	verifier, challenge, err := auth.GeneratePKCE()
+	if err != nil {
+		http.Error(w, "Failed to start login", http.StatusInternalServerError)
+		return
+	}
 
-	state, _ := auth.GenerateState()
+	state, err := auth.GenerateState()
+	if err != nil {
+		http.Error(w, "Failed to start login", http.StatusInternalServerError)
+		return
+	}
+
+	// The PKCE verifier must never leave the server in plaintext.
+	sealedVerifier, err := s.auth.Sessions.SealValue(verifier)
+	if err != nil {
+		http.Error(w, "Failed to start login", http.StatusInternalServerError)
+		return
+	}
 
 	http.SetCookie(w, &http.Cookie{
-		Name:     "pkce_verifier",
-		Value:    verifier,
+		Name:     auth.PKCEVerifierCookieName,
+		Value:    sealedVerifier,
 		Path:     "/auth/callback",
 		HttpOnly: true,
 		Secure:   r.TLS != nil,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   300,
+	})
+
+	// The state cookie lets /auth/callback tie the callback back to this
+	// login attempt; without it the flow is open to login CSRF.
+	http.SetCookie(w, &http.Cookie{
+		Name:     auth.StateCookieName,
+		Value:    state,
+		Path:     "/auth/callback",
+		HttpOnly: true,
+		Secure:   r.TLS != nil,
+		SameSite: http.SameSiteLaxMode,
 		MaxAge:   300,
 	})
 
@@ -63,13 +92,32 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 	// PROOF
 	slog.Info("Callback hit", "full_url", r.URL.String(), "code_length", len(code))
 
-	cookie, err := r.Cookie("pkce_verifier")
+	// CSRF: the state parameter must match the value /auth/login stored in
+	// the auth_state cookie, compared in constant time so mismatching
+	// callbacks leak nothing about the expected value.
+	stateCookie, err := r.Cookie(auth.StateCookieName)
+	if err != nil {
+		http.Error(w, "Invalid state parameter", http.StatusBadRequest)
+		return
+	}
+	state := r.URL.Query().Get("state")
+	if state == "" || subtle.ConstantTimeCompare([]byte(state), []byte(stateCookie.Value)) != 1 {
+		http.Error(w, "Invalid state parameter", http.StatusBadRequest)
+		return
+	}
+
+	verifierCookie, err := r.Cookie(auth.PKCEVerifierCookieName)
+	if err != nil {
+		http.Error(w, "Missing authorization code or verifier", http.StatusBadRequest)
+		return
+	}
+	verifier, err := s.auth.Sessions.OpenValue(verifierCookie.Value)
 	if err != nil {
 		http.Error(w, "Missing authorization code or verifier", http.StatusBadRequest)
 		return
 	}
 
-	token, err := s.auth.Exchange(r.Context(), code, cookie.Value)
+	token, err := s.auth.Exchange(r.Context(), code, verifier)
 	if err != nil {
 		http.Error(w, "Token exchange failed:"+err.Error(), http.StatusUnauthorized)
 		return
@@ -113,6 +161,20 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   maxAge,
 	})
+
+	// The state and verifier are single-use; clear both now that the login
+	// completed.
+	for _, name := range []string{auth.StateCookieName, auth.PKCEVerifierCookieName} {
+		http.SetCookie(w, &http.Cookie{
+			Name:     name,
+			Value:    "",
+			Path:     "/auth/callback",
+			HttpOnly: true,
+			Secure:   r.TLS != nil,
+			SameSite: http.SameSiteLaxMode,
+			MaxAge:   -1,
+		})
+	}
 
 	http.Redirect(w, r, "/", http.StatusFound)
 }

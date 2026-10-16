@@ -2,8 +2,11 @@ package api
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -150,25 +153,153 @@ func TestPoliciesAccess(t *testing.T) {
 	}
 }
 
+func TestHandleLogin(t *testing.T) {
+	handler, env := newTestHandler(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/auth/login", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusFound {
+		t.Fatalf("status = %d, want %d; body = %q", rec.Code, http.StatusFound, rec.Body.String())
+	}
+
+	loc, err := url.Parse(rec.Header().Get("Location"))
+	if err != nil {
+		t.Fatalf("parse Location: %v", err)
+	}
+	q := loc.Query()
+	stateParam := q.Get("state")
+	if stateParam == "" {
+		t.Error("redirect URL has no state parameter")
+	}
+	if q.Get("code_challenge_method") != "S256" {
+		t.Errorf("code_challenge_method = %q, want S256", q.Get("code_challenge_method"))
+	}
+
+	cookies := rec.Result().Cookies()
+	stateCookie := findCookie(cookies, auth.StateCookieName)
+	if stateCookie == nil {
+		t.Fatal("auth_state cookie not set")
+	}
+	if stateCookie.Value != stateParam {
+		t.Errorf("auth_state = %q, want the state sent to the IdP %q", stateCookie.Value, stateParam)
+	}
+	if !stateCookie.HttpOnly {
+		t.Error("auth_state should be HttpOnly")
+	}
+	if stateCookie.Path != "/auth/callback" {
+		t.Errorf("auth_state Path = %q, want /auth/callback", stateCookie.Path)
+	}
+	if stateCookie.MaxAge != 300 {
+		t.Errorf("auth_state MaxAge = %d, want 300", stateCookie.MaxAge)
+	}
+
+	verifierCookie := findCookie(cookies, auth.PKCEVerifierCookieName)
+	if verifierCookie == nil {
+		t.Fatal("pkce_verifier cookie not set")
+	}
+	if !verifierCookie.HttpOnly {
+		t.Error("pkce_verifier should be HttpOnly")
+	}
+	if verifierCookie.Path != "/auth/callback" {
+		t.Errorf("pkce_verifier Path = %q, want /auth/callback", verifierCookie.Path)
+	}
+	if verifierCookie.MaxAge != 300 {
+		t.Errorf("pkce_verifier MaxAge = %d, want 300", verifierCookie.MaxAge)
+	}
+
+	// The cookie must hold the sealed verifier whose challenge went to the
+	// IdP, not the plaintext verifier.
+	verifier, err := env.SessionCodec.OpenValue(verifierCookie.Value)
+	if err != nil {
+		t.Fatalf("pkce_verifier is not sealed: %v", err)
+	}
+	sum := sha256.Sum256([]byte(verifier))
+	if got, want := base64.RawURLEncoding.EncodeToString(sum[:]), q.Get("code_challenge"); got != want {
+		t.Errorf("code_challenge = %q, want SHA-256 of the sealed verifier %q", want, got)
+	}
+}
+
 func TestHandleCallback(t *testing.T) {
 	handler, env := newTestHandler(t)
 
-	t.Run("missing verifier cookie", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodGet, "/auth/callback?code=auth-code", nil)
+	const state = "test-state"
+
+	t.Run("missing state cookie", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/auth/callback?code=auth-code&state="+state, nil)
 		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, req)
 
 		if rec.Code != http.StatusBadRequest {
 			t.Errorf("status = %d, want %d", rec.Code, http.StatusBadRequest)
 		}
+		if !strings.Contains(rec.Body.String(), "Invalid state parameter") {
+			t.Errorf("body = %q, want invalid state error", rec.Body.String())
+		}
+	})
+
+	t.Run("state cookie mismatch", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/auth/callback?code=auth-code&state=attacker-state", nil)
+		req.AddCookie(&http.Cookie{Name: auth.StateCookieName, Value: state})
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("status = %d, want %d", rec.Code, http.StatusBadRequest)
+		}
+		if !strings.Contains(rec.Body.String(), "Invalid state parameter") {
+			t.Errorf("body = %q, want invalid state error", rec.Body.String())
+		}
+	})
+
+	t.Run("missing state query parameter", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/auth/callback?code=auth-code", nil)
+		req.AddCookie(&http.Cookie{Name: auth.StateCookieName, Value: state})
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("status = %d, want %d", rec.Code, http.StatusBadRequest)
+		}
+		if !strings.Contains(rec.Body.String(), "Invalid state parameter") {
+			t.Errorf("body = %q, want invalid state error", rec.Body.String())
+		}
+	})
+
+	t.Run("missing verifier cookie", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/auth/callback?code=auth-code&state="+state, nil)
+		req.AddCookie(&http.Cookie{Name: auth.StateCookieName, Value: state})
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("status = %d, want %d; body = %q", rec.Code, http.StatusBadRequest, rec.Body.String())
+		}
 		if !strings.Contains(rec.Body.String(), "Missing authorization code or verifier") {
 			t.Errorf("body = %q", rec.Body.String())
 		}
 	})
 
+	t.Run("raw verifier in cookie is rejected", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/auth/callback?code=auth-code&state="+state, nil)
+		req.AddCookie(&http.Cookie{Name: auth.StateCookieName, Value: state})
+		req.AddCookie(&http.Cookie{Name: auth.PKCEVerifierCookieName, Value: "raw-verifier"})
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("status = %d, want %d; body = %q", rec.Code, http.StatusBadRequest, rec.Body.String())
+		}
+		if !strings.Contains(rec.Body.String(), "Missing authorization code or verifier") {
+			t.Errorf("body = %q, want missing verifier error", rec.Body.String())
+		}
+	})
+
 	t.Run("exchange failure", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodGet, "/auth/callback", nil)
-		req.AddCookie(&http.Cookie{Name: "pkce_verifier", Value: "verifier"})
+		req := httptest.NewRequest(http.MethodGet, "/auth/callback?state="+state, nil)
+		req.AddCookie(&http.Cookie{Name: auth.StateCookieName, Value: state})
+		req.AddCookie(&http.Cookie{Name: auth.PKCEVerifierCookieName, Value: env.SealValue(t, "verifier")})
 		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, req)
 
@@ -177,9 +308,10 @@ func TestHandleCallback(t *testing.T) {
 		}
 	})
 
-	t.Run("sets admin_session and redirects", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodGet, "/auth/callback?code=auth-code", nil)
-		req.AddCookie(&http.Cookie{Name: "pkce_verifier", Value: "verifier"})
+	t.Run("sets admin_session, clears login cookies, and redirects", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/auth/callback?code=auth-code&state="+state, nil)
+		req.AddCookie(&http.Cookie{Name: auth.StateCookieName, Value: state})
+		req.AddCookie(&http.Cookie{Name: auth.PKCEVerifierCookieName, Value: env.SealValue(t, "verifier")})
 		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, req)
 
@@ -191,13 +323,21 @@ func TestHandleCallback(t *testing.T) {
 		}
 
 		cookies := rec.Result().Cookies()
-		var session *http.Cookie
-		for _, c := range cookies {
-			if c.Name == "admin_session" {
-				session = c
-				break
+
+		// The state and verifier are single-use: both flow cookies must be
+		// deleted alongside the login completing.
+		for _, name := range []string{auth.StateCookieName, auth.PKCEVerifierCookieName} {
+			c := findCookie(cookies, name)
+			if c == nil {
+				t.Errorf("%s cookie not set for deletion", name)
+				continue
+			}
+			if c.MaxAge != -1 {
+				t.Errorf("%s MaxAge = %d, want deletion (-1)", name, c.MaxAge)
 			}
 		}
+
+		session := findCookie(cookies, auth.SessionCookieName)
 		if session == nil {
 			t.Fatal("admin_session cookie not set")
 		}
@@ -233,4 +373,49 @@ func TestHandleCallback(t *testing.T) {
 			t.Errorf("sealed ID token subject = %q, want %q", idToken.Subject, authtest.Subject)
 		}
 	})
+}
+
+func TestLoginCallbackFlow(t *testing.T) {
+	handler, _ := newTestHandler(t)
+
+	// /auth/login mints the state and verifier cookies and redirects to the IdP.
+	loginRec := httptest.NewRecorder()
+	handler.ServeHTTP(loginRec, httptest.NewRequest(http.MethodGet, "/auth/login", nil))
+	if loginRec.Code != http.StatusFound {
+		t.Fatalf("login status = %d, want %d", loginRec.Code, http.StatusFound)
+	}
+
+	loc, err := url.Parse(loginRec.Header().Get("Location"))
+	if err != nil {
+		t.Fatalf("parse login redirect: %v", err)
+	}
+	state := loc.Query().Get("state")
+
+	// The IdP redirects back with the code; the flow cookies from /auth/login
+	// must satisfy the callback's state and verifier checks.
+	req := httptest.NewRequest(http.MethodGet, "/auth/callback?code=auth-code&state="+state, nil)
+	for _, c := range loginRec.Result().Cookies() {
+		req.AddCookie(c)
+	}
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusFound {
+		t.Fatalf("callback status = %d, want %d; body = %q", rec.Code, http.StatusFound, rec.Body.String())
+	}
+	if loc := rec.Header().Get("Location"); loc != "/" {
+		t.Errorf("Location = %q, want /", loc)
+	}
+	if findCookie(rec.Result().Cookies(), auth.SessionCookieName) == nil {
+		t.Error("admin_session cookie not set after login flow")
+	}
+}
+
+func findCookie(cookies []*http.Cookie, name string) *http.Cookie {
+	for _, c := range cookies {
+		if c.Name == name {
+			return c
+		}
+	}
+	return nil
 }

@@ -9,7 +9,7 @@ Unit tests need no external services. The shared harness in `internal/authtest` 
 * `authtest.Setup(t)` — mock issuer plus an `Env` for minting ID tokens and intercepting token requests
 * `authtest.SetupAuth(t)` — the same issuer paired with a fully discovered `auth.Authenticator` (and the `SessionCodec` used to seal `admin_session` cookies)
 
-The `internal/auth` and `internal/api` suites both build on it, and `internal/auth/session_test.go` covers the AES-256-GCM codec that seals the session cookie (round trips, nonce uniqueness, tamper and wrong-key rejection).
+The `internal/auth` and `internal/api` suites both build on it: `internal/auth/session_test.go` covers the AES-256-GCM codec that seals the session cookie and the PKCE verifier (round trips, nonce uniqueness, tamper and wrong-key rejection), and the router suite covers the login/callback flow (state validation, the sealed verifier, and the end-to-end login).
 
 ```bash
 go test ./...
@@ -49,6 +49,40 @@ The `admin_session` cookie is sealed with an AES-256-GCM key derived from `SESSI
 ```bash
 export SESSION_SECRET="$(openssl rand -base64 32)"
 ```
+
+## Login flow cookies (`auth_state`, `pkce_verifier`)
+
+`/auth/login` sets two short-lived (300 s) `HttpOnly` cookies scoped to `/auth/callback`:
+
+* `auth_state` — the CSRF `state` value also sent to the IdP. `/auth/callback` compares it with the `state` query parameter in constant time and rejects a mismatch, an empty state, or a missing cookie with **400**, closing login CSRF.
+* `pkce_verifier` — the PKCE verifier sealed with the same AES-256-GCM codec as `admin_session`, so its value is opaque. A verifier cookie that cannot be decrypted is rejected with the same **400** as a missing one.
+
+Both cookies are cleared once the callback completes a login, making the state and verifier single-use.
+
+Live checks (Dex running, `go run ./cmd/bouncer-admin`):
+
+```bash
+# Capture the login redirect and the flow cookies
+LOGIN_URL=$(curl -sS -c /tmp/bouncer-cookies.txt -o /dev/null \
+  -w '%{redirect_url}' http://127.0.0.1:8080/auth/login)
+STATE=$(python3 -c "from urllib.parse import urlparse, parse_qs; print(parse_qs(urlparse('$LOGIN_URL').query)['state'][0])")
+
+# 400 — state that does not match the auth_state cookie
+curl -i -b /tmp/bouncer-cookies.txt \
+  "http://127.0.0.1:8080/auth/callback?code=x&state=attacker-state"
+# → 400 Invalid state parameter
+
+# 400 — no state at all
+curl -i -b /tmp/bouncer-cookies.txt "http://127.0.0.1:8080/auth/callback?code=x"
+# → 400 Invalid state parameter
+
+# 400 — raw (unsealed) PKCE verifier replayed as pkce_verifier
+curl -i -H "Cookie: auth_state=$STATE; pkce_verifier=raw-verifier" \
+  "http://127.0.0.1:8080/auth/callback?code=x&state=$STATE"
+# → 400 Missing authorization code or verifier
+```
+
+A normal browser login still completes: the flow cookies are valid and are cleared on the callback that sets `admin_session`.
 
 ## Testing `/api/policies`
 

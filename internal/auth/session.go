@@ -64,7 +64,20 @@ func (c *SessionCodec) Seal(set TokenSet) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("failed to marshal token set: %w", err)
 	}
+	return c.seal(plaintext)
+}
 
+// SealValue seals a single secret string — such as the PKCE verifier — into a
+// cookie-safe value. It is the string counterpart of Seal for payloads that
+// are not token sets.
+func (c *SessionCodec) SealValue(value string) (string, error) {
+	return c.seal([]byte(value))
+}
+
+// seal encrypts and authenticates plaintext, returning a cookie-safe string.
+// Every call uses a fresh random nonce, so sealing the same plaintext twice
+// yields different values.
+func (c *SessionCodec) seal(plaintext []byte) (string, error) {
 	nonce := make([]byte, c.aead.NonceSize())
 	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
 		return "", fmt.Errorf("failed to read session nonce: %w", err)
@@ -81,19 +94,9 @@ func (c *SessionCodec) Seal(set TokenSet) (string, error) {
 func (c *SessionCodec) Open(value string) (TokenSet, error) {
 	var set TokenSet
 
-	sealed, err := base64.RawURLEncoding.DecodeString(value)
+	plaintext, err := c.open(value)
 	if err != nil {
-		return set, errInvalidSession
-	}
-
-	nonceSize := c.aead.NonceSize()
-	if len(sealed) < nonceSize+c.aead.Overhead() {
-		return set, errInvalidSession
-	}
-
-	plaintext, err := c.aead.Open(nil, sealed[:nonceSize], sealed[nonceSize:], nil)
-	if err != nil {
-		return set, errInvalidSession
+		return set, err
 	}
 
 	if err := json.Unmarshal(plaintext, &set); err != nil {
@@ -101,4 +104,36 @@ func (c *SessionCodec) Open(value string) (TokenSet, error) {
 	}
 
 	return set, nil
+}
+
+// OpenValue decrypts a value produced by SealValue. All failures return
+// errInvalidSession, matching Open.
+func (c *SessionCodec) OpenValue(value string) (string, error) {
+	plaintext, err := c.open(value)
+	if err != nil {
+		return "", err
+	}
+	return string(plaintext), nil
+}
+
+// open decrypts and authenticates a value produced by seal. All failures —
+// tampering, wrong key, or malformed input — return errInvalidSession so
+// callers cannot distinguish failure reasons.
+func (c *SessionCodec) open(value string) ([]byte, error) {
+	sealed, err := base64.RawURLEncoding.DecodeString(value)
+	if err != nil {
+		return nil, errInvalidSession
+	}
+
+	nonceSize := c.aead.NonceSize()
+	if len(sealed) < nonceSize+c.aead.Overhead() {
+		return nil, errInvalidSession
+	}
+
+	plaintext, err := c.aead.Open(nil, sealed[:nonceSize], sealed[nonceSize:], nil)
+	if err != nil {
+		return nil, errInvalidSession
+	}
+
+	return plaintext, nil
 }

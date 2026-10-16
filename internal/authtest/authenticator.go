@@ -51,3 +51,16 @@ func (e *AuthEnv) SealSession(t *testing.T, set auth.TokenSet) string {
 	}
 	return sealed
 }
+
+// SealValue seals a single secret string exactly the way the /auth/login
+// handler seals the pkce_verifier cookie. Use it to mint verifier cookies in
+// tests.
+func (e *AuthEnv) SealValue(t *testing.T, value string) string {
+	t.Helper()
+
+	sealed, err := e.SessionCodec.SealValue(value)
+	if err != nil {
+		t.Fatalf("seal value: %v", err)
+	}
+	return sealed
+}
